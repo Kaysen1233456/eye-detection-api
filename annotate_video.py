@@ -24,13 +24,14 @@ from eye_detect_api import (
 
 def draw_overlay(frame: np.ndarray, prob_close: float, prob_open: float,
                  status: str, fps: float, inference_ms: float) -> np.ndarray:
-    """在帧的左上角绘制检测结果叠加层。"""
+    """在帧的右上角绘制检测结果叠加层。"""
     h, w = frame.shape[:2]
     overlay = frame.copy()
 
-    # 半透明背景框
+    # 半透明背景框（右上角）
     box_w, box_h = 320, 110
-    cv2.rectangle(overlay, (0, 0), (box_w, box_h), (0, 0, 0), -1)
+    x0 = w - box_w
+    cv2.rectangle(overlay, (x0, 0), (w, box_h), (0, 0, 0), -1)
     frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
 
     # 状态颜色
@@ -45,7 +46,7 @@ def draw_overlay(frame: np.ndarray, prob_close: float, prob_open: float,
         label = "N/A"
 
     # 概率条背景
-    bar_x, bar_y, bar_w, bar_h = 10, 70, 300, 20
+    bar_x, bar_y, bar_w, bar_h = x0 + 10, 70, 300, 20
     cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (60, 60, 60), -1)
     # 概率条填充（闭眼概率，红色填充）
     fill_w = int(prob_close * bar_w)
@@ -53,12 +54,12 @@ def draw_overlay(frame: np.ndarray, prob_close: float, prob_open: float,
 
     # 文字
     font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(frame, f"Eye Detection", (10, 25), font, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(frame, f"Status: {label}", (10, 50), font, 0.55, color, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"Eye Detection", (x0 + 10, 25), font, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(frame, f"Status: {label}", (x0 + 10, 50), font, 0.55, color, 1, cv2.LINE_AA)
     cv2.putText(frame, f"Close: {prob_close:.1%}  Open: {prob_open:.1%}",
-                (10, 95), font, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+                (x0 + 10, 95), font, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
     cv2.putText(frame, f"Inference: {inference_ms:.0f}ms",
-                (10, box_h - 5), font, 0.35, (150, 150, 150), 1, cv2.LINE_AA)
+                (x0 + 10, box_h - 5), font, 0.35, (150, 150, 150), 1, cv2.LINE_AA)
 
     return frame
 

@@ -91,7 +91,7 @@ python annotate_video.py -i input.mp4 -o output.mp4 --gpu
 python annotate_video.py -i input.mp4 -o output.mp4 --gpu --window 32 --step 16
 ```
 
-输出视频左上角会叠加：
+输出视频右上角会叠加：
 - 状态：OPEN（绿色）/ CLOSED（红色）
 - 闭眼概率条
 - 百分比数值
@@ -236,7 +236,7 @@ python annotate_video.py -i input.mp4 -o output.mp4 --gpu
 python annotate_video.py -i input.mp4 -o output.mp4 --gpu --window 32 --step 16
 ```
 
-Output video overlay (top-left corner):
+Output video overlay (top-right corner):
 - Status: OPEN (green) / CLOSED (red)
 - Eye-closed probability bar
 - Percentage values
