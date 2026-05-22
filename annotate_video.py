@@ -160,15 +160,14 @@ def run_annotation(args):
                   f"[{elapsed:.1f}s elapsed]")
 
     # 处理未被覆盖的帧（前后插值）
-    for f in range(total_frames):
-        if not frame_valid[f]:
-            # 找最近的有效帧
-            valid_idx = np.where(frame_valid)[0]
-            if len(valid_idx) > 0:
+    valid_idx = np.where(frame_valid)[0]
+    if len(valid_idx) > 0:
+        for f in range(total_frames):
+            if not frame_valid[f]:
                 nearest = valid_idx[np.argmin(np.abs(valid_idx - f))]
                 frame_probs[f] = frame_probs[nearest]
-            else:
-                frame_probs[f] = [0.5, 0.5]  # 无数据时默认
+    else:
+        frame_probs[:] = [0.5, 0.5]  # 无数据时默认
 
     # 写输出视频
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,7 +175,6 @@ def run_annotation(args):
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
     print(f"\n写入输出视频: {output_path.name}")
-    decord.bridge.set_bridge('torch')
 
     for f in range(total_frames):
         # 读帧
@@ -197,6 +195,7 @@ def run_annotation(args):
             print(f"  写入帧 {f}/{total_frames}")
 
     writer.release()
+    del vr  # 显式释放 VideoReader
     total_time = time.perf_counter() - t_start
     print(f"\n完成! 输出: {output_path}")
     print(f"总耗时: {total_time:.1f}s ({total_time/duration_sec:.1f}x 实时速度)")

@@ -11,6 +11,8 @@
 日期：2025-11-13
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import types
@@ -118,6 +120,10 @@ class EyeDetectionAPI:
         self.face_pad_ratio = face_pad_ratio
 
 
+        # 设置 decord bridge 为 torch 模式（全局只设置一次）
+        if decord.bridge.current_bridge() != 'torch':
+            decord.bridge.set_bridge('torch')
+
         # 加载配置
         self.cfg = self._load_config(config_path, checkpoint_path)
 
@@ -160,10 +166,6 @@ class EyeDetectionAPI:
         """构建并加载模型"""
         # 初始化分布式训练环境（单机单卡模式）
         du.init_distributed_training(self.cfg)
-
-        # 设置随机种子
-        np.random.seed(self.cfg.RNG_SEED)
-        torch.manual_seed(self.cfg.RNG_SEED)
 
         # 构建模型（CPU上构建）
         from slowfast.models.build import MODEL_REGISTRY
@@ -320,7 +322,6 @@ class EyeDetectionAPI:
 
             # 打开视频文件
             video_container = VideoReader(input_params.video_path, ctx=cpu(0))
-            decord.bridge.set_bridge('torch')
 
             total_frame = len(video_container)
             fps = video_container.get_avg_fps()
