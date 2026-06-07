@@ -132,3 +132,22 @@ work_dirs/
 
 result
 annotation
+
+# Local runtime artifacts and large files
+core.*
+runs/
+runs-*/
+retrain_output/
+finetuned_model/
+training_data/
+training_data_augmented/
+training_json/
+close/
+clip/*.pth
+clip/*.pyth
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.csv
+*.xlsx

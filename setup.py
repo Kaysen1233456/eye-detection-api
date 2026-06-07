@@ -18,6 +18,7 @@ setup(
         "simplejson",
         "tqdm",
         "psutil",
+        "matplotlib",
         # "detectron2",
         "opencv-python",
         "pandas",

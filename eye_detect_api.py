@@ -11,66 +11,48 @@
 日期：2025-11-13
 """
 
-from __future__ import annotations
-
 import os
 import sys
-import types
 
-# ========== 禁用TensorFlow/CUDA警告 ==========
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-# ==========================================
-
-# ========== 兼容性修复：pytorchvideo 需要 functional_tensor ==========
-import torchvision.transforms.functional as _F
-_functional_tensor = types.ModuleType('torchvision.transforms.functional_tensor')
-_functional_tensor.rgb_to_grayscale = _F.rgb_to_grayscale
-sys.modules['torchvision.transforms.functional_tensor'] = _functional_tensor
+# ========== 禁用TensorFlow/CUDA警告（必须在导入DeepFace之前） ==========
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # 禁用TensorFlow日志
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # 禁用oneDNN优化警告
 # =====================================================================
-
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-
-import cv2
-import decord
 import numpy as np
 import torch
+import cv2
+import types
+from dataclasses import dataclass
+from typing import Optional, Tuple
 from decord import VideoReader, cpu
+import decord
+import torchvision.transforms.functional as _tvF
+
+_functional_tensor = types.ModuleType("torchvision.transforms.functional_tensor")
+_functional_tensor.rgb_to_grayscale = _tvF.rgb_to_grayscale
+sys.modules["torchvision.transforms.functional_tensor"] = _functional_tensor
 
 # 添加项目路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../../slowfast'))
 
 from slowfast.config.defaults import assert_and_infer_cfg
-from slowfast.datasets import decoder
-from slowfast.datasets import utils as dataset_utils
 from slowfast.utils.parser import load_config
+from slowfast.models import build_model
+from slowfast.datasets import utils as dataset_utils
+from slowfast.datasets import decoder
 import slowfast.utils.checkpoint as cu
 import slowfast.utils.distributed as du
+import slowfast.utils.logging as logging
 
-# ========== 检测参数常量 ==========
-NUM_ENSEMBLE_VIEWS = 4           # 单GPU 默认集成视图数
-NUM_SPATIAL_CROPS = 3            # 空间裁剪数（左/中/右）
-RNG_SEED = 6666                  # 随机种子
-SAMPLING_RATE = 16               # 时间采样率（覆盖 8*16=128 帧）
-SPATIAL_SIZE = 224               # 空间裁剪尺寸
-FACE_CASCADE_SCALE = 1.1         # Haar 级联缩放因子
-FACE_CASCADE_NEIGHBORS = 5       # Haar 级联最小邻居数
-FACE_CASCADE_MIN_SIZE = (30, 30) # Haar 级联最小人脸尺寸
-VIEWS_PER_GPU = 76               # 多GPU模式下每卡视图数
-
-# 使用OpenCV人脸检测（避免TensorFlow与PyTorch CUDA冲突）
-_face_cascade = None
-
-def _get_face_cascade():
-    global _face_cascade
-    if _face_cascade is None:
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        _face_cascade = cv2.CascadeClassifier(cascade_path)
-    return _face_cascade
+# 尝试导入DeepFace
+try:
+    from deepface import DeepFace
+    print("====")
+    DEEPFACE_AVAILABLE = True
+except ImportError:
+    DEEPFACE_AVAILABLE = False
+    DeepFace = None
 
 
 @dataclass
@@ -89,7 +71,7 @@ class EyeDetectionOutput:
     result: str                  # 'eye_close' 或 'eye_open'
     confidence: float           # 置信度分数 [0-1]
     success: bool               # 检测是否成功
-    error_message: str | None = None
+    error_message: Optional[str] = None  # 错误信息（如果失败）
 
 
 class EyeDetectionAPI:
@@ -118,11 +100,8 @@ class EyeDetectionAPI:
         self.device = device
         self.enable_face_extraction = enable_face_extraction
         self.face_pad_ratio = face_pad_ratio
+        self.use_gpu = str(device).startswith("cuda")
 
-
-        # 设置 decord bridge 为 torch 模式（全局只设置一次）
-        if decord.bridge.current_bridge() != 'torch':
-            decord.bridge.set_bridge('torch')
 
         # 加载配置
         self.cfg = self._load_config(config_path, checkpoint_path)
@@ -139,18 +118,18 @@ class EyeDetectionAPI:
             def __init__(self):
                 self.cfg_file = config_path
                 self.opts = [
-                    "NUM_GPUS", "1",
+                    "NUM_GPUS", "1" if device.startswith("cuda") else "0",
                     "NUM_SHARDS", "1",
                     "TRAIN.ENABLE", "False",
                     "TEST.ENABLE", "True",
-                    "TEST.NUM_ENSEMBLE_VIEWS", str(NUM_ENSEMBLE_VIEWS),
-                    "TEST.NUM_SPATIAL_CROPS", str(NUM_SPATIAL_CROPS),
+                    "TEST.NUM_ENSEMBLE_VIEWS", "4",      # 关键参数：集成视图数
+                    "TEST.NUM_SPATIAL_CROPS", "3",       # 关键参数：空间裁剪数
                     "TEST.TEST_BEST", "True",
                     "TEST.ADD_SOFTMAX", "True",
                     "TEST.CHECKPOINT_FILE_PATH", checkpoint_path,
-                    "RNG_SEED", str(RNG_SEED),
+                    "RNG_SEED", "6666",                  # 关键参数：随机种子
                     "BALANCE_DATA", "False",
-                    "DEEPFACE", "False",
+                    "DEEPFACE", "True",
                     "INPUT_CLIP", "False",
                     "VISUAL", "False",
                     "LAST_FRAMES", "False",
@@ -167,100 +146,144 @@ class EyeDetectionAPI:
         # 初始化分布式训练环境（单机单卡模式）
         du.init_distributed_training(self.cfg)
 
-        # 构建模型（CPU上构建）
-        from slowfast.models.build import MODEL_REGISTRY
-        model = MODEL_REGISTRY.get(self.cfg.MODEL.MODEL_NAME)(self.cfg)
+        # 设置随机种子
+        np.random.seed(self.cfg.RNG_SEED)
+        torch.manual_seed(self.cfg.RNG_SEED)
 
-        # 先在CPU上加载checkpoint
+        # 构建模型
+        model = build_model(self.cfg)
+
+        # 加载checkpoint
         cu.load_test_checkpoint(self.cfg, model)
 
         # 设置为评估模式
         model.eval()
 
-        # 最后转移到GPU
         if self.cfg.NUM_GPUS:
             model = model.to(self.device)
 
         return model
 
-    def _detect_face_bbox(self, frames_np: np.ndarray) -> tuple | None:
-        """从帧中检测人脸bbox（只检测，不裁剪）。"""
-        face_cascade = _get_face_cascade()
-        T = frames_np.shape[0]
-
-        for i in range(T):
-            frame = frames_np[i]
-            if frame.dtype != np.uint8:
-                frame = (frame * 255).astype(np.uint8)
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(
-                gray, scaleFactor=FACE_CASCADE_SCALE,
-                minNeighbors=FACE_CASCADE_NEIGHBORS,
-                minSize=FACE_CASCADE_MIN_SIZE
-            )
-            if len(faces) > 0:
-                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-                pad_w = int(w * self.face_pad_ratio)
-                pad_h = int(h * self.face_pad_ratio)
-                return (x, y, w, h, pad_w, pad_h)
-        return None
-
-    def _apply_face_crop(self, frames: torch.Tensor, bbox: tuple) -> torch.Tensor:
-        """使用给定bbox裁剪人脸区域。"""
-        T, H, W, C = frames.shape
-        frames_np = frames.numpy()
-        x, y, w, h, pad_w, pad_h = bbox
-
-        new_x = max(0, x - pad_w)
-        new_y = max(0, y - pad_h)
-        new_w = min(W - new_x, w + 2 * pad_w)
-        new_h = min(H - new_y, h + 2 * pad_h)
-
-        processed = []
-        for i in range(T):
-            frame = frames_np[i]
-            if frame.dtype != np.uint8:
-                frame = (frame * 255).astype(np.uint8)
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            face_region = frame_bgr[int(new_y):int(new_y+new_h), int(new_x):int(new_x+new_w)]
-            resized = cv2.resize(face_region, (W, H))
-            processed.append(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
-
-        return torch.from_numpy(np.array(processed))
-
-    def _extract_face_region(self, frames: torch.Tensor, cached_bbox: tuple | None = None) -> tuple[torch.Tensor, tuple | None]:
+    def _extract_face_region(self, frames: torch.Tensor) -> torch.Tensor:
         """
         从视频帧中提取人脸区域
 
         Args:
             frames: 视频帧张量，形状为 (T, H, W, C)
-            cached_bbox: 缓存的人脸bbox，如果提供则跳过检测
 
         Returns:
-            (处理后的帧张量, 人脸bbox)
+            处理后的帧张量，形状为 (T, H, W, C)
         """
-        if not self.enable_face_extraction:
-            return frames, None
-
-        if cached_bbox is not None:
-            return self._apply_face_crop(frames, cached_bbox), cached_bbox
-
+        if not self.enable_face_extraction or not DEEPFACE_AVAILABLE:
+            print(DEEPFACE_AVAILABLE, self.enable_face_extraction)
+            return frames
+        print("===========================")
+        T, H, W, C = frames.shape
         frames_np = frames.numpy()
-        bbox = self._detect_face_bbox(frames_np)
 
-        if bbox is not None:
-            return self._apply_face_crop(frames, bbox), bbox
+        face_detected_in_video = False
+        last_valid_bbox = None
+        processed_frames = []
 
-        # 未检测到人脸，返回原帧
-        return frames, None
+        for i in range(T):
+            current_frame = frames_np[i]
+
+            if current_frame.shape[2] == 3:
+                if current_frame.dtype != np.uint8:
+                    current_frame = (current_frame * 255).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR)
+            else:
+                frame_bgr = current_frame
+
+            current_face = None
+
+            try:
+                print("=++++++31++++++++++++++++++")
+
+                face_objs = DeepFace.extract_faces(
+                    img_path=frame_bgr,
+                    detector_backend='opencv',
+                    align=True,
+                    enforce_detection=False
+                )
+                print("=++++++++++++++++++++++++")
+                print(f"[DeepFace] frame={i} faces={len(face_objs)}")
+
+                if len(face_objs) > 0:
+                    face = face_objs[0]
+                    area = face['facial_area']
+
+                    x, y, w, h = area['x'], area['y'], area['w'], area['h']
+                    print(f"[DeepFace] frame={i} bbox=({x},{y},{w},{h})")
+
+                    pad_w = int(w * self.face_pad_ratio)
+                    pad_h = int(h * self.face_pad_ratio)
+
+                    last_valid_bbox = (x, y, w, h, pad_w, pad_h)
+
+                    new_x = max(0, x - pad_w)
+                    new_y = max(0, y - pad_h)
+                    new_w = min(W - new_x, w + 2*pad_w)
+                    new_h = min(H - new_y, h + 2*pad_h)
+
+                    face_region = frame_bgr[
+                        int(new_y):int(new_y+new_h),
+                        int(new_x):int(new_x+new_w)
+                    ]
+
+                    resized_face = cv2.resize(face_region, (W, H))
+
+                    if resized_face.dtype != np.uint8:
+                        resized_face = (resized_face * 255).astype(np.uint8)
+
+                    current_face = cv2.cvtColor(resized_face, cv2.COLOR_BGR2RGB)
+                    face_detected_in_video = True
+
+            except Exception as e:
+                # 捕获详细错误信息用于调试
+                import traceback
+                error_msg = f"Frame {i} face detection error: {str(e)}\n{traceback.format_exc()}"
+                print(error_msg)
+
+            if current_face is None and last_valid_bbox is not None:
+                x, y, w, h, pad_w, pad_h = last_valid_bbox
+
+                new_x = max(0, x - pad_w)
+                new_y = max(0, y - pad_h)
+                new_w = min(W - new_x, w + 2*pad_w)
+                new_h = min(H - new_y, h + 2*pad_h)
+
+                face_region = frame_bgr[
+                    int(new_y):int(new_y+new_h),
+                    int(new_x):int(new_x+new_w)
+                ]
+
+                resized_face = cv2.resize(face_region, (W, H))
+                if resized_face.dtype != np.uint8:
+                    resized_face = (resized_face * 255).astype(np.uint8)
+                current_face = cv2.cvtColor(resized_face, cv2.COLOR_BGR2RGB)
+
+            if face_detected_in_video:
+                if current_face is not None:
+                    final_frame = current_face
+                else:
+                    final_frame = np.zeros((H, W, 3), dtype=np.uint8)
+            else:
+                final_frame = current_frame
+
+            processed_frames.append(final_frame)
+
+        processed_frames = np.array(processed_frames)
+        processed_frames = torch.from_numpy(processed_frames)
+
+        return processed_frames
 
     def _calculate_frame_indices(self,
                                  video_st_time: int,
                                  video_ed_time: int,
                                  event_st_time: int,
                                  event_ed_time: int,
-                                 fps: float) -> tuple[int | None, int | None]:
+                                 fps: float) -> Tuple[Optional[int], Optional[int]]:
         """
         计算事件对应的帧索引
 
@@ -296,16 +319,12 @@ class EyeDetectionAPI:
         return start_frame, end_frame
 
     @torch.no_grad()
-    def detect(self, input_params: EyeDetectionInput,
-               view_start: int | None = None,
-               view_end: int | None = None) -> EyeDetectionOutput:
+    def detect(self, input_params: EyeDetectionInput) -> EyeDetectionOutput:
         """
         执行闭眼检测（主接口）
 
         Args:
             input_params: 检测输入参数
-            view_start: 起始视图索引（用于多GPU拆分），None表示从0开始
-            view_end: 结束视图索引（不含），None表示到最后一个
 
         Returns:
             EyeDetectionOutput: 检测结果
@@ -322,6 +341,7 @@ class EyeDetectionAPI:
 
             # 打开视频文件
             video_container = VideoReader(input_params.video_path, ctx=cpu(0))
+            decord.bridge.set_bridge('torch')
 
             total_frame = len(video_container)
             fps = video_container.get_avg_fps()
@@ -343,75 +363,73 @@ class EyeDetectionAPI:
                     error_message="事件时间超出视频时间范围"
                 )
 
-            # 多视图batch推理：遍历所有时间视图和空间裁剪
-            num_views = self.cfg.TEST.NUM_ENSEMBLE_VIEWS
-            num_crops = self.cfg.TEST.NUM_SPATIAL_CROPS
-            sampling_rate = dataset_utils.get_random_sampling_rate(0, SAMPLING_RATE)
-            batch_inputs = []
-            face_bbox_cache = None
+            # 视频解码
+            temporal_sample_index = 0
+            sampling_rate = dataset_utils.get_random_sampling_rate(0, 16)
 
-            v_start = view_start if view_start is not None else 0
-            v_end = view_end if view_end is not None else num_views
+            frames = decoder.decode(
+                video_container,
+                sampling_rate,
+                self.cfg.DATA.NUM_FRAMES,
+                temporal_sample_index,
+                self.cfg.TEST.NUM_ENSEMBLE_VIEWS,
+                backend=self.cfg.DATA.DECODING_BACKEND,
+                max_spatial_scale=224,
+                use_offset=self.cfg.DATA.USE_OFFSET_SAMPLING,
+                sparse=True,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                video_frame_count=total_frame,
+                INPUT_CLIP=False,
+                VISUAL=False,
+                EVALUATE=False,
+                LAST_FRAMES=False
+            )
 
-            for temporal_idx in range(v_start, v_end):
-                frames = decoder.decode(
-                    video_container,
-                    sampling_rate,
-                    self.cfg.DATA.NUM_FRAMES,
-                    temporal_idx,
-                    num_views,
-                    backend=self.cfg.DATA.DECODING_BACKEND,
-                    max_spatial_scale=SPATIAL_SIZE,
-                    use_offset=self.cfg.DATA.USE_OFFSET_SAMPLING,
-                    sparse=True,
-                    start_frame=start_frame,
-                    end_frame=end_frame,
-                    video_frame_count=total_frame,
-                    INPUT_CLIP=False,
-                    VISUAL=False,
-                    EVALUATE=False,
-                    LAST_FRAMES=False
-                )
+            # 人脸区域提取
+            if self.enable_face_extraction:
+                frames = self._extract_face_region(frames)
 
-                if self.enable_face_extraction:
-                    frames, face_bbox_cache = self._extract_face_region(frames, face_bbox_cache)
+            # 数据归一化
+            frames = dataset_utils.tensor_normalize(
+                frames, self.cfg.DATA.MEAN, self.cfg.DATA.STD
+            )
 
-                frames = dataset_utils.tensor_normalize(
-                    frames, self.cfg.DATA.MEAN, self.cfg.DATA.STD
-                )
-                frames = frames.permute(3, 0, 1, 2)
+            # T H W C -> C T H W
+            frames = frames.permute(3, 0, 1, 2)
 
-                for spatial_idx in range(num_crops):
-                    spatial_frames = dataset_utils.spatial_sampling(
-                        frames,
-                        spatial_idx=spatial_idx,
-                        min_scale=SPATIAL_SIZE,
-                        max_scale=SPATIAL_SIZE,
-                        crop_size=SPATIAL_SIZE,
-                        random_horizontal_flip=False,
-                        inverse_uniform_sampling=self.cfg.DATA.INV_UNIFORM_SAMPLE,
-                    )
-                    packed = dataset_utils.pack_pathway_output(self.cfg, spatial_frames)[0]
-                    batch_inputs.append(packed)
+            # 空间采样
+            frames = dataset_utils.spatial_sampling(
+                frames,
+                spatial_idx=0,
+                min_scale=224,
+                max_scale=224,
+                crop_size=224,
+                random_horizontal_flip=self.cfg.DATA.RANDOM_FLIP,
+                inverse_uniform_sampling=self.cfg.DATA.INV_UNIFORM_SAMPLE,
+            )
 
-            # 堆叠成batch：[num_views * num_crops, C, T, H, W]
-            batch_tensor = torch.stack(batch_inputs, dim=0)
-            del batch_inputs
-            inputs = [batch_tensor]
+            # 准备输入
+            inputs = dataset_utils.pack_pathway_output(self.cfg, frames)[0]
+            inputs = [inputs.unsqueeze(0)]  # 添加batch维度，注意用列表包裹
 
             # 转移到GPU
             if self.cfg.NUM_GPUS:
-                for i in range(len(inputs)):
-                    inputs[i] = inputs[i].to(self.device, non_blocking=True)
+                if isinstance(inputs, (list,)):
+                    for i in range(len(inputs)):
+                        inputs[i] = inputs[i].cuda(non_blocking=True)
+                else:
+                    inputs = inputs.cuda(non_blocking=True)
 
             # 模型推理
             preds = self.model(inputs).softmax(-1)
             preds = preds.cpu()
 
-            # 所有视图的预测取平均
-            avg_probs = preds.mean(dim=0).numpy()
-            pred_id = int(avg_probs.argmax())
-            confidence = float(avg_probs[pred_id])
+            # 获取预测结果（与原始代码保持一致）
+            pred_id = torch.argmax(preds[0]).item()  # 使用整个预测向量
+            pred_probs = preds[0].numpy()
+            print(f"[Model] probs={pred_probs.tolist()} pred_id={pred_id}")
+            confidence = float(pred_probs[pred_id])
             result = 'eye_close' if pred_id == 1 else 'eye_open'
 
             return EyeDetectionOutput(
@@ -438,7 +456,7 @@ def create_eye_detector(config_path: str,
                        enable_face_extraction: bool = True,
                        face_pad_ratio: float = 0.5) -> EyeDetectionAPI:
     """
-    创建闭眼检测器实例的便捷函数（单GPU版本）
+    创建闭眼检测器实例的便捷函数
 
     Args:
         config_path: 配置文件路径
@@ -454,163 +472,6 @@ def create_eye_detector(config_path: str,
         config_path=config_path,
         checkpoint_path=checkpoint_path,
         device=device,
-        enable_face_extraction=enable_face_extraction,
-        face_pad_ratio=face_pad_ratio
-    )
-
-
-class MultiGPUEyeDetector:
-    """
-    多GPU并行闭眼检测器
-
-    在每个可用GPU上创建独立的检测器实例，通过线程池并行调度，
-    自动将检测任务分配到空闲GPU上，最大化吞吐量。
-    """
-
-    def __init__(self,
-                 config_path: str,
-                 checkpoint_path: str,
-                 gpu_ids: list[int] | None = None,
-                 enable_face_extraction: bool = True,
-                 face_pad_ratio: float = 0.5):
-        """
-        初始化多GPU检测器
-
-        Args:
-            config_path: 配置文件路径
-            checkpoint_path: 模型checkpoint路径
-            gpu_ids: 使用的GPU ID列表，None则使用所有可用GPU
-            enable_face_extraction: 是否启用人脸提取
-            face_pad_ratio: 人脸区域扩展比例
-        """
-        if gpu_ids is None:
-            gpu_ids = list(range(torch.cuda.device_count()))
-
-        total_views = VIEWS_PER_GPU * len(gpu_ids)
-
-        self.detectors = []
-        for gpu_id in gpu_ids:
-            detector = EyeDetectionAPI(
-                config_path=config_path,
-                checkpoint_path=checkpoint_path,
-                device=f'cuda:{gpu_id}',
-                enable_face_extraction=enable_face_extraction,
-                face_pad_ratio=face_pad_ratio
-            )
-            # 覆盖为多GPU优化的视图数
-            detector.cfg.TEST.NUM_ENSEMBLE_VIEWS = total_views
-            self.detectors.append(detector)
-
-        self._current_idx = 0
-        self._lock = threading.Lock()
-        self._total_views = total_views
-
-    def detect(self, input_params: EyeDetectionInput) -> EyeDetectionOutput:
-        """
-        执行闭眼检测（自动拆分视图到多GPU并行推理）
-
-        Args:
-            input_params: 检测输入参数
-
-        Returns:
-            EyeDetectionOutput: 检测结果
-        """
-        num_gpus = len(self.detectors)
-        if num_gpus <= 1:
-            return self.detectors[0].detect(input_params)
-
-        num_views = self.detectors[0].cfg.TEST.NUM_ENSEMBLE_VIEWS
-        # 拆分视图范围到各GPU
-        chunk_size = num_views // num_gpus
-        ranges = []
-        for i in range(num_gpus):
-            start = i * chunk_size
-            end = start + chunk_size if i < num_gpus - 1 else num_views
-            ranges.append((start, end))
-
-        # 并行推理
-        partial_results = [None] * num_gpus
-        with ThreadPoolExecutor(max_workers=num_gpus) as executor:
-            future_to_idx = {}
-            for i, (start, end) in enumerate(ranges):
-                future = executor.submit(
-                    self.detectors[i].detect, input_params, start, end
-                )
-                future_to_idx[future] = i
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                partial_results[idx] = future.result()
-
-        # 合并结果：平均所有GPU的预测概率
-        all_probs = []
-        for r in partial_results:
-            if not r.success:
-                return r
-            # 从confidence和result反推概率
-            if r.result == 'eye_close':
-                all_probs.append([1 - r.confidence, r.confidence])
-            else:
-                all_probs.append([r.confidence, 1 - r.confidence])
-
-        avg_probs = np.mean(all_probs, axis=0)
-        pred_id = int(avg_probs.argmax())
-        confidence = float(avg_probs[pred_id])
-        result = 'eye_close' if pred_id == 1 else 'eye_open'
-
-        return EyeDetectionOutput(
-            result=result,
-            confidence=confidence,
-            success=True,
-            error_message=None
-        )
-
-    def detect_batch(self, inputs: list[EyeDetectionInput]) -> list[EyeDetectionOutput]:
-        """
-        批量并行检测（多GPU并行）
-
-        Args:
-            inputs: 检测输入参数列表
-
-        Returns:
-            检测结果列表
-        """
-        results = [None] * len(inputs)
-        with ThreadPoolExecutor(max_workers=len(self.detectors)) as executor:
-            future_to_idx = {}
-            for i, inp in enumerate(inputs):
-                with self._lock:
-                    idx = self._current_idx
-                    self._current_idx = (self._current_idx + 1) % len(self.detectors)
-                future = executor.submit(self.detectors[idx].detect, inp)
-                future_to_idx[future] = i
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                results[idx] = future.result()
-        return results
-
-
-def create_multi_gpu_detector(config_path: str,
-                              checkpoint_path: str,
-                              gpu_ids: list[int] | None = None,
-                              enable_face_extraction: bool = True,
-                              face_pad_ratio: float = 0.5) -> MultiGPUEyeDetector:
-    """
-    创建多GPU并行检测器的便捷函数
-
-    Args:
-        config_path: 配置文件路径
-        checkpoint_path: 模型checkpoint路径
-        gpu_ids: GPU ID列表，None则使用所有可用GPU
-        enable_face_extraction: 是否启用人脸提取
-        face_pad_ratio: 人脸区域扩展比例
-
-    Returns:
-        MultiGPUEyeDetector: 多GPU检测器实例
-    """
-    return MultiGPUEyeDetector(
-        config_path=config_path,
-        checkpoint_path=checkpoint_path,
-        gpu_ids=gpu_ids,
         enable_face_extraction=enable_face_extraction,
         face_pad_ratio=face_pad_ratio
     )

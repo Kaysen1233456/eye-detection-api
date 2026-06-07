@@ -1,0 +1,108 @@
+# 重新训练配置 - 基于增强后的数据
+# 继承自 dms+k400_k710_b16_f8x224，调整训练参数
+
+TRAIN:
+  ENABLE: True
+  DATASET: hf
+  BATCH_SIZE: 8                    # 从 256 降到 8，适应小数据集
+  EVAL_PERIOD: 5                   # 每 5 个 epoch 评估一次
+  CHECKPOINT_PERIOD: 10            # 每 10 个 epoch 保存一次
+  AUTO_RESUME: True
+
+DATA:
+  USE_OFFSET_SAMPLING: True
+  DECODING_BACKEND: decord
+  NUM_FRAMES: 8
+  SAMPLING_RATE: 16
+  TRAIN_JITTER_SCALES: [256, 320]
+  TRAIN_CROP_SIZE: 224
+  TEST_CROP_SIZE: 224
+  INPUT_CHANNEL_NUM: [3]
+  TRAIN_JITTER_SCALES_RELATIVE: [0.08, 1.0]
+  TRAIN_JITTER_ASPECT_RELATIVE: [0.75, 1.3333]
+  MEAN: [0.485, 0.456, 0.406]
+  STD: [0.229, 0.224, 0.225]
+  PATH_TO_DATA_DIR_TRAIN: /yanglin/eye_detect/training_json/train.json
+  PATH_TO_DATA_DIR_VAL: /yanglin/eye_detect/training_json/val.json
+
+UNIFORMERV2:
+  BACKBONE: 'uniformerv2_b16'
+  N_LAYERS: 4
+  N_DIM: 768
+  N_HEAD: 12
+  MLP_FACTOR: 4.0
+  BACKBONE_DROP_PATH_RATE: 0.
+  DROP_PATH_RATE: 0.1             # 增加 dropout
+  MLP_DROPOUT: [0.5, 0.5, 0.5, 0.5]
+  CLS_DROPOUT: 0.5
+  RETURN_LIST: [8, 9, 10, 11]
+  NO_LMHRA: True
+  TEMPORAL_DOWNSAMPLE: False
+  PRETRAIN: 'clip/k400_k710_uniformerv2_b16_8x224.pyth'
+  DELETE_SPECIAL_HEAD: True
+  FROZEN: False                    # 不冻结，全部微调
+
+AUG:
+  NUM_SAMPLE: 1
+  ENABLE: True
+  COLOR_JITTER: 0.4
+  AA_TYPE: rand-m7-n4-mstd0.5-inc1
+  INTERPOLATION: bicubic
+  RE_PROB: 0.5                     # 增加 Random Erasing 概率
+  RE_MODE: pixel
+  RE_COUNT: 1
+  RE_SPLIT: False
+
+BN:
+  USE_PRECISE_STATS: False
+  NUM_BATCHES_PRECISE: 200
+
+SOLVER:
+  ZERO_WD_1D_PARAM: True
+  BASE_LR_SCALE_NUM_SHARDS: True
+  BASE_LR: 1e-5                    # 从 4e-4 降到 1e-5
+  COSINE_AFTER_WARMUP: True
+  COSINE_END_LR: 1e-7
+  WARMUP_START_LR: 1e-7
+  WARMUP_EPOCHS: 5                 # 增加 warmup
+  LR_POLICY: cosine
+  MAX_EPOCH: 100                   # 增加到 100 个 epoch
+  MOMENTUM: 0.9
+  WEIGHT_DECAY: 0.05
+  OPTIMIZING_METHOD: adamw
+
+MODEL:
+  NUM_CLASSES: 2
+  ARCH: uniformerv2
+  MODEL_NAME: Uniformerv2
+  LOSS_FUNC: cross_entropy
+  DROPOUT_RATE: 0.5
+  USE_CHECKPOINT: False
+  CHECKPOINT_NUM: [0]
+
+TEST:
+  ENABLE: True
+  DATASET: hf
+  BATCH_SIZE: 8
+  NUM_SPATIAL_CROPS: 1
+  NUM_ENSEMBLE_VIEWS: 1
+
+DATA_LOADER:
+  NUM_WORKERS: 4                   # 从 8 降到 4
+  PIN_MEMORY: True
+
+TENSORBOARD:
+  ENABLE: True                     # 启用 tensorboard
+
+NUM_GPUS: 1                        # 单卡训练
+NUM_SHARDS: 1
+RNG_SEED: 42
+OUTPUT_DIR: /yanglin/eye_detect/retrain_output
+
+# 自定义配置
+DEEPFACE: False                    # 不使用 DeepFace 裁剪
+BALANCE_DATA: True                 # 平衡数据
+VISUAL: False
+INPUT_CLIP: False
+LAST_FRAMES: False
+EVALUATE: False

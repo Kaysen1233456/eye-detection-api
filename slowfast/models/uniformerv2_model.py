@@ -15,14 +15,13 @@ import slowfast.utils.logging as logging
 logger = logging.get_logger(__name__)
 
 
-# 自动定位 clip 目录（相对于项目根目录）
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CLIP_PATH = os.path.join(_PROJECT_ROOT, "clip")
-
+MODEL_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "clip")
+)
 _MODELS = {
-    "ViT-B/16": os.path.join(CLIP_PATH, "vit_b16.pth"),
-    "ViT-L/14": os.path.join(CLIP_PATH, "vit_l14.pth"),
-    "ViT-L/14_336": os.path.join(CLIP_PATH, "vit_l14_336.pth"),
+    "ViT-B/16": os.path.join(MODEL_PATH, "vit_b16.pth"),
+    "ViT-L/14": os.path.join(MODEL_PATH, "vit_l14.pth"),
+    "ViT-L/14_336": os.path.join(MODEL_PATH, "vit_l14_336.pth"),
 }
 
 
